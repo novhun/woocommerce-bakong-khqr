@@ -5,7 +5,7 @@
  * Description: Accept payments via Bakong KHQR in WooCommerce
  * Author: Nov Hun
  * Author URI: https://github.com/novhun/woocommerce-bakong-khqr
- * Version: 1.1.0
+ * Version: 1.2.1
  * Requires at least: 5.0
  * Tested up to: 6.4
  * WC requires at least: 3.0
@@ -14,468 +14,567 @@
  * Domain Path: /languages
  */
 
+// Prevent direct access
 if (!defined('ABSPATH')) {
-    exit; // Exit if accessed directly
+    exit;
 }
 
-// Check if WooCommerce is active
-if (!in_array('woocommerce/woocommerce.php', apply_filters('active_plugins', get_option('active_plugins')))) {
-    return;
+// Define debug constants only if not already defined
+if (!defined('WP_DEBUG')) {
+    define('WP_DEBUG', true);
 }
-
-// Include Composer autoload
-if (file_exists(dirname(__FILE__) . '/vendor/autoload.php')) {
-    require_once dirname(__FILE__) . '/vendor/autoload.php';
+if (!defined('WP_DEBUG_LOG')) {
+    define('WP_DEBUG_LOG', true);
 }
-
-use KHQR\BakongKHQR;
-use KHQR\Helpers\KHQRData;
-use KHQR\Models\IndividualInfo;
+if (!defined('WP_DEBUG_DISPLAY')) {
+    define('WP_DEBUG_DISPLAY', false);
+}
 
 // Declare HPOS compatibility
-add_action('before_woocommerce_init', function () {
+add_action('before_woocommerce_init', function() {
     if (class_exists('\Automattic\WooCommerce\Utilities\FeaturesUtil')) {
         \Automattic\WooCommerce\Utilities\FeaturesUtil::declare_compatibility('custom_order_tables', __FILE__, true);
     }
 });
 
-// Add the gateway to WooCommerce
-add_filter('woocommerce_payment_gateways', 'add_bakong_khqr_gateway');
-function add_bakong_khqr_gateway($gateways) {
-    $gateways[] = 'WC_Gateway_Bakong_KHQR';
-    return $gateways;
+// Check if vendor/autoload.php exists
+if (!file_exists(__DIR__ . '/vendor/autoload.php')) {
+    error_log('Autoload file not found in ' . __DIR__ . '/vendor/autoload.php. Ensure Composer dependencies are installed.');
+    wp_die('Autoload file not found. Run "composer install" in the plugin directory.');
 }
 
-// Initialize the plugin
+require_once __DIR__ . '/vendor/autoload.php';
+
+use KHQR\BakongKHQR;
+use KHQR\Helpers\KHQRData;
+use KHQR\Models\MerchantInfo;
+use Endroid\QrCode\QrCode;
+
+// Ensure WooCommerce is active
+if (!in_array('woocommerce/woocommerce.php', apply_filters('active_plugins', get_option('active_plugins')))) {
+    add_action('admin_notices', function() {
+        echo '<div class="error"><p>WooCommerce Bakong KHQR Payment Gateway requires WooCommerce to be installed and active.</p></div>';
+    });
+    return;
+}
+
 add_action('plugins_loaded', 'init_bakong_khqr_gateway');
 function init_bakong_khqr_gateway() {
-    class WC_Gateway_Bakong_KHQR extends WC_Payment_Gateway {
+    class WC_Bakong_KHQR_Gateway extends WC_Payment_Gateway {
         public function __construct() {
             $this->id = 'bakong_khqr';
-            $this->icon = apply_filters('woocommerce_bakong_khqr_icon', plugins_url('assets/icon.png', __FILE__));
-            $this->has_fields = false;
-            $this->method_title = __('Bakong KHQR', 'woocommerce-bakong-khqr');
-            $this->method_description = __('Pay with Bakong KHQR mobile banking', 'woocommerce-bakong-khqr');
-            
+            $this->icon = plugin_dir_url(__FILE__) . 'assets/khqr-logo.png';
+            $this->has_fields = true;
+            $this->method_title = 'Bakong KHQR Payment';
+            $this->method_description = 'Pay with Bakong KHQR (USD/KHR)';
+
             $this->init_form_fields();
             $this->init_settings();
-            
+
             $this->title = $this->get_option('title');
             $this->description = $this->get_option('description');
             $this->bakong_account_id = $this->get_option('bakong_account_id');
             $this->merchant_name = $this->get_option('merchant_name');
             $this->merchant_city = $this->get_option('merchant_city');
             $this->api_token = $this->get_option('api_token');
-            
+
             add_action('woocommerce_update_options_payment_gateways_' . $this->id, array($this, 'process_admin_options'));
-            add_action('woocommerce_thankyou_' . $this->id, array($this, 'thankyou_page'));
-            add_action('admin_post_bakong_khqr_test_payment', array($this, 'handle_test_payment'));
+            add_action('wp_enqueue_scripts', array($this, 'payment_scripts'));
+            add_action('admin_enqueue_scripts', array($this, 'admin_scripts'));
         }
 
         public function init_form_fields() {
             $this->form_fields = array(
                 'enabled' => array(
-                    'title' => __('Enable/Disable', 'woocommerce-bakong-khqr'),
+                    'title' => 'Enable/Disable',
                     'type' => 'checkbox',
-                    'label' => __('Enable Bakong KHQR Payment', 'woocommerce-bakong-khqr'),
+                    'label' => 'Enable Bakong KHQR Payment',
                     'default' => 'yes'
                 ),
                 'title' => array(
-                    'title' => __('Title', 'woocommerce-bakong-khqr'),
+                    'title' => 'Title',
                     'type' => 'text',
-                    'description' => __('This controls the title which the user sees during checkout.', 'woocommerce-bakong-khqr'),
-                    'default' => __('Bakong KHQR Payment', 'woocommerce-bakong-khqr'),
-                    'desc_tip' => true,
+                    'default' => 'Bakong KHQR Payment'
                 ),
                 'description' => array(
-                    'title' => __('Description', 'woocommerce-bakong-khqr'),
+                    'title' => 'Description',
                     'type' => 'textarea',
-                    'description' => __('Payment method description that the customer will see on your checkout.', 'woocommerce-bakong-khqr'),
-                    'default' => __('Pay securely using Bakong KHQR mobile banking.', 'woocommerce-bakong-khqr'),
-                    'desc_tip' => true,
+                    'default' => 'Pay securely with Bakong KHQR (USD or KHR)'
                 ),
                 'bakong_account_id' => array(
-                    'title' => __('Bakong Account ID', 'woocommerce-bakong-khqr'),
+                    'title' => 'Bakong Account ID',
                     'type' => 'text',
-                    'description' => __('Your Bakong Account ID (e.g., yourname@bank)', 'woocommerce-bakong-khqr'),
-                    'default' => '',
-                    'desc_tip' => true,
+                    'description' => 'Your Bakong Account ID (e.g., youraccount@nbc.gov.kh)'
                 ),
                 'merchant_name' => array(
-                    'title' => __('Merchant Name', 'woocommerce-bakong-khqr'),
+                    'title' => 'Merchant Name',
                     'type' => 'text',
-                    'description' => __('Your merchant name as registered with Bakong', 'woocommerce-bakong-khqr'),
-                    'default' => '',
-                    'desc_tip' => true,
+                    'description' => 'Your business name'
                 ),
                 'merchant_city' => array(
-                    'title' => __('Merchant City', 'woocommerce-bakong-khqr'),
+                    'title' => 'Merchant City',
                     'type' => 'text',
-                    'description' => __('Your merchant city (e.g., Phnom Penh)', 'woocommerce-bakong-khqr'),
-                    'default' => 'Phnom Penh',
-                    'desc_tip' => true,
+                    'description' => 'Your city (e.g., Phnom Penh)'
                 ),
                 'api_token' => array(
-                    'title' => __('API Token', 'woocommerce-bakong-khqr'),
-                    'type' => 'text',
-                    'description' => __('Your Bakong API token from https://api-bakong.nbc.gov.kh/register', 'woocommerce-bakong-khqr'),
-                    'default' => '',
-                    'desc_tip' => true,
-                ),
+                    'title' => 'API Token',
+                    'type' => 'password',
+                    'description' => 'Get this from Bakong API dashboard'
+                )
             );
         }
 
-        public function admin_options() {
-            $test_result = get_transient('bakong_khqr_test_result'); // Get test result if available
-            delete_transient('bakong_khqr_test_result'); // Clear after display
-            ?>
-            <div class="bakong-khqr-settings">
-                <div class="card shadow-sm border-0">
-                    <div class="card-header bg-primary text-white">
-                        <h3 class="mb-0"><i class="fas fa-qrcode me-2"></i>Bakong KHQR Payment Settings</h3>
-                    </div>
-                    <div class="card-body">
-                        <div class="alert alert-info d-flex align-items-center" role="alert">
-                            <i class="fas fa-info-circle me-2"></i>
-                            <div>
-                                Configure your Bakong KHQR payment gateway settings below. Get your API token from 
-                                <a href="https://api-bakong.nbc.gov.kh/register" target="_blank" class="alert-link">Bakong Portal</a>.
-                            </div>
-                        </div>
+        public function payment_scripts() {
+            if (!is_checkout() && !is_wc_endpoint_url('order-received')) return;
+            wp_enqueue_style('bootstrap-css', 'https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css');
+            wp_enqueue_script('bootstrap-js', 'https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js', array('jquery'), null, true);
+        }
 
-                        <form method="post" id="wc_bakong_khqr_form">
-                            <?php wp_nonce_field('woocommerce-settings'); ?>
-                            <div class="row g-4">
-                                <div class="col-12">
-                                    <div class="form-check form-switch">
-                                        <input class="form-check-input" type="checkbox" 
-                                               id="woocommerce_bakong_khqr_enabled" 
-                                               name="woocommerce_bakong_khqr_enabled" 
-                                               <?php echo $this->get_option('enabled') === 'yes' ? 'checked' : ''; ?>>
-                                        <label class="form-check-label" for="woocommerce_bakong_khqr_enabled">
-                                            <?php _e('Enable Bakong KHQR Payment', 'woocommerce-bakong-khqr'); ?>
-                                        </label>
-                                    </div>
-                                </div>
+        public function admin_scripts($hook) {
+            if ($hook !== 'toplevel_page_bakong-khqr-settings' && $hook !== 'bakong-khqr_page_bakong-khqr-info') return;
+            wp_enqueue_style('bootstrap-css', 'https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css');
+            wp_enqueue_script('bootstrap-js', 'https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js', array('jquery'), null, true);
+            wp_enqueue_script('html5-qrcode', 'https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js', array(), null, true);
+        }
 
-                                <div class="col-md-6">
-                                    <div class="form-floating">
-                                        <input type="text" class="form-control" 
-                                               id="woocommerce_bakong_khqr_title" 
-                                               name="woocommerce_bakong_khqr_title" 
-                                               value="<?php echo esc_attr($this->get_option('title')); ?>"
-                                               placeholder="Payment Title">
-                                        <label for="woocommerce_bakong_khqr_title"><?php _e('Title', 'woocommerce-bakong-khqr'); ?></label>
-                                    </div>
-                                    <small class="text-muted"><?php _e('Title shown during checkout', 'woocommerce-bakong-khqr'); ?></small>
-                                </div>
-
-                                <div class="col-md-6">
-                                    <div class="form-floating">
-                                        <textarea class="form-control" 
-                                                  id="woocommerce_bakong_khqr_description" 
-                                                  name="woocommerce_bakong_khqr_description" 
-                                                  placeholder="Payment Description"><?php echo esc_textarea($this->get_option('description')); ?></textarea>
-                                        <label for="woocommerce_bakong_khqr_description"><?php _e('Description', 'woocommerce-bakong-khqr'); ?></label>
-                                    </div>
-                                    <small class="text-muted"><?php _e('Description shown during checkout', 'woocommerce-bakong-khqr'); ?></small>
-                                </div>
-
-                                <div class="col-md-6">
-                                    <div class="form-floating">
-                                        <input type="text" class="form-control" 
-                                               id="woocommerce_bakong_khqr_bakong_account_id" 
-                                               name="woocommerce_bakong_khqr_bakong_account_id" 
-                                               value="<?php echo esc_attr($this->get_option('bakong_account_id')); ?>"
-                                               placeholder="Bakong Account ID">
-                                        <label for="woocommerce_bakong_khqr_bakong_account_id"><?php _e('Bakong Account ID', 'woocommerce-bakong-khqr'); ?></label>
-                                    </div>
-                                    <small class="text-muted"><?php _e('Format: yourname@bank', 'woocommerce-bakong-khqr'); ?></small>
-                                </div>
-
-                                <div class="col-md-6">
-                                    <div class="form-floating">
-                                        <input type="text" class="form-control" 
-                                               id="woocommerce_bakong_khqr_merchant_name" 
-                                               name="woocommerce_bakong_khqr_merchant_name" 
-                                               value="<?php echo esc_attr($this->get_option('merchant_name')); ?>"
-                                               placeholder="Merchant Name">
-                                        <label for="woocommerce_bakong_khqr_merchant_name"><?php _e('Merchant Name', 'woocommerce-bakong-khqr'); ?></label>
-                                    </div>
-                                </div>
-
-                                <div class="col-md-6">
-                                    <div class="form-floating">
-                                        <input type="text" class="form-control" 
-                                               id="woocommerce_bakong_khqr_merchant_city" 
-                                               name="woocommerce_bakong_khqr_merchant_city" 
-                                               value="<?php echo esc_attr($this->get_option('merchant_city')); ?>"
-                                               placeholder="Merchant City">
-                                        <label for="woocommerce_bakong_khqr_merchant_city"><?php _e('Merchant City', 'woocommerce-bakong-khqr'); ?></label>
-                                    </div>
-                                </div>
-
-                                <div class="col-md-6">
-                                    <div class="form-floating">
-                                        <input type="text" class="form-control" 
-                                               id="woocommerce_bakong_khqr_api_token" 
-                                               name="woocommerce_bakong_khqr_api_token" 
-                                               value="<?php echo esc_attr($this->get_option('api_token')); ?>"
-                                               placeholder="API Token">
-                                        <label for="woocommerce_bakong_khqr_api_token"><?php _e('API Token', 'woocommerce-bakong-khqr'); ?></label>
-                                    </div>
-                                    <small class="text-muted"><?php _e('Get from Bakong Portal', 'woocommerce-bakong-khqr'); ?></small>
-                                </div>
-                            </div>
-
-                            <div class="mt-4">
-                                <button type="submit" class="btn btn-primary btn-lg">
-                                    <i class="fas fa-save me-2"></i><?php _e('Save Changes', 'woocommerce-bakong-khqr'); ?>
-                                </button>
-                            </div>
-                        </form>
-
-                        <!-- Test Payment Section -->
-                        <hr class="my-4">
-                        <h4 class="mt-4"><i class="fas fa-flask me-2"></i><?php _e('Test Payment', 'woocommerce-bakong-khqr'); ?></h4>
-                        <form method="post" action="<?php echo admin_url('admin-post.php'); ?>" class="mt-3">
-                            <input type="hidden" name="action" value="bakong_khqr_test_payment">
-                            <?php wp_nonce_field('bakong_khqr_test_payment_nonce', 'test_payment_nonce'); ?>
-                            <div class="row g-3">
-                                <div class="col-md-6">
-                                    <div class="form-floating">
-                                        <input type="number" class="form-control" 
-                                               id="test_amount" 
-                                               name="test_amount" 
-                                               value="1000" 
-                                               min="1" 
-                                               required 
-                                               placeholder="Test Amount">
-                                        <label for="test_amount"><?php _e('Test Amount (KHR)', 'woocommerce-bakong-khqr'); ?></label>
-                                    </div>
-                                </div>
-                                <div class="col-md-6 d-flex align-items-end">
-                                    <button type="submit" class="btn btn-success w-100">
-                                        <i class="fas fa-play me-2"></i><?php _e('Generate Test QR', 'woocommerce-bakong-khqr'); ?>
-                                    </button>
-                                </div>
-                            </div>
-                        </form>
-
-                        <?php if ($test_result): ?>
-                            <div class="mt-4">
-                                <?php if ($test_result['success']): ?>
-                                    <div class="alert alert-success" role="alert">
-                                        <h5><i class="fas fa-check-circle me-2"></i><?php _e('Test Successful', 'woocommerce-bakong-khqr'); ?></h5>
-                                        <p><?php _e('QR Code Generated:', 'woocommerce-bakong-khqr'); ?></p>
-                                        <img src="https://chart.googleapis.com/chart?chs=200x200&cht=qr&chl=<?php echo urlencode($test_result['qr']); ?>" alt="Test QR Code" class="img-fluid mb-3">
-                                        <p><strong>MD5:</strong> <?php echo esc_html($test_result['md5']); ?></p>
-                                        <?php if ($test_result['status']): ?>
-                                            <p><strong>Transaction Status:</strong> <?php echo esc_html($test_result['status']); ?></p>
-                                        <?php endif; ?>
-                                    </div>
-                                <?php else: ?>
-                                    <div class="alert alert-danger" role="alert">
-                                        <h5><i class="fas fa-exclamation-triangle me-2"></i><?php _e('Test Failed', 'woocommerce-bakong-khqr'); ?></h5>
-                                        <p><?php echo esc_html($test_result['message']); ?></p>
-                                    </div>
-                                <?php endif; ?>
-                            </div>
-                        <?php endif; ?>
-                    </div>
-                </div>
-            </div>
-            <?php
+        public function payment_fields() {
+            echo '<div class="khqr-payment-fields">' . wpautop(wp_kses_post($this->description)) . 
+                 '<select name="khqr_currency" class="form-control w-25">
+                    <option value="KHR">KHR</option>
+                    <option value="USD">USD</option>
+                  </select></div>';
         }
 
         public function process_payment($order_id) {
             $order = wc_get_order($order_id);
-            
+            $amount = $order->get_total();
+            $currency = isset($_POST['khqr_currency']) ? sanitize_text_field($_POST['khqr_currency']) : 'KHR';
+
             try {
-                $individualInfo = new IndividualInfo(
+                $merchantInfo = new MerchantInfo(
                     bakongAccountID: $this->bakong_account_id,
                     merchantName: $this->merchant_name,
                     merchantCity: $this->merchant_city,
-                    currency: KHQRData::CURRENCY_KHR,
-                    amount: $order->get_total() * 100 // Convert to smallest unit
+                    merchantID: 'WC_' . $order_id,
+                    acquiringBank: 'Bakong',
+                    mobileNumber: ''
                 );
-                
-                $response = BakongKHQR::generateIndividual($individualInfo);
-                
-                if ($response->status['code'] === 0) {
-                    $order->update_meta_data('_bakong_khqr_code', $response->data['qr']);
-                    $order->update_meta_data('_bakong_khqr_md5', $response->data['md5']);
-                    $order->update_status('on-hold', __('Awaiting Bakong KHQR payment', 'woocommerce-bakong-khqr'));
-                    $order->save();
-                    
+
+                $khqr = new BakongKHQR($this->api_token);
+                $currency_code = $currency === 'USD' ? KHQRData::CURRENCY_USD : KHQRData::CURRENCY_KHR;
+                $response = BakongKHQR::generateMerchant($merchantInfo, $amount, $currency_code);
+
+                if ($response->status->code === 0) {
+                    $qr_code = $response->data->qr;
+                    $md5 = $response->data->md5;
+
+                    update_post_meta($order_id, '_khqr_qr', $qr_code);
+                    update_post_meta($order_id, '_khqr_md5', $md5);
+                    update_post_meta($order_id, '_khqr_currency', $currency);
+
+                    $order->update_status('pending', 'Awaiting KHQR payment');
                     wc_reduce_stock_levels($order_id);
-                    WC()->cart->empty_cart();
-                    
+
                     return array(
                         'result' => 'success',
-                        'redirect' => $this->get_return_url($order)
+                        'redirect' => add_query_arg(
+                            array('order_id' => $order_id, 'khqr' => urlencode($qr_code)),
+                            $this->get_return_url($order))
                     );
+                } else {
+                    $errorMessage = $response->status->message ?? 'Unknown error from Bakong API';
+                    wc_add_notice('Payment error: ' . $errorMessage, 'error');
+                    return array('result' => 'failure');
                 }
-                
-                throw new Exception(__('KHQR generation failed', 'woocommerce-bakong-khqr'));
-                
             } catch (Exception $e) {
-                wc_add_notice(__('Payment error: ', 'woocommerce-bakong-khqr') . $e->getMessage(), 'error');
+                error_log('Process Payment Error: ' . $e->getMessage());
+                wc_add_notice('Payment error: ' . $e->getMessage(), 'error');
                 return array('result' => 'failure');
             }
         }
+    }
 
-        public function thankyou_page($order_id) {
-            $order = wc_get_order($order_id);
-            $qr_code = $order->get_meta('_bakong_khqr_code');
-            
-            if ($qr_code) {
-                echo '<div class="text-center">';
-                echo '<h3>' . __('Scan to Pay with Bakong', 'woocommerce-bakong-khqr') . '</h3>';
-                echo '<p>' . __('Please scan this QR code using your Bakong mobile app to complete the payment.', 'woocommerce-bakong-khqr') . '</p>';
-                echo '<img src="https://chart.googleapis.com/chart?chs=300x300&cht=qr&chl=' . urlencode($qr_code) . '" alt="KHQR Code" class="img-fluid mb-3">';
-                echo '<p>' . __('After payment, your order will be processed once we receive confirmation.', 'woocommerce-bakong-khqr') . '</p>';
-                echo '</div>';
-            }
-        }
-
-        public function handle_test_payment() {
-            if (!current_user_can('manage_options') || !isset($_POST['test_payment_nonce']) || !wp_verify_nonce($_POST['test_payment_nonce'], 'bakong_khqr_test_payment_nonce')) {
-                wp_die(__('Permission denied', 'woocommerce-bakong-khqr'));
-            }
-
-            $test_amount = isset($_POST['test_amount']) ? floatval($_POST['test_amount']) * 100 : 1000; // Default to 10 KHR if not set
-
-            try {
-                $individualInfo = new IndividualInfo(
-                    bakongAccountID: $this->bakong_account_id,
-                    merchantName: $this->merchant_name,
-                    merchantCity: $this->merchant_city,
-                    currency: KHQRData::CURRENCY_KHR,
-                    amount: $test_amount
-                );
-
-                $response = BakongKHQR::generateIndividual($individualInfo);
-
-                if ($response->status['code'] !== 0) {
-                    throw new Exception(__('KHQR generation failed', 'woocommerce-bakong-khqr'));
-                }
-
-                $result = array(
-                    'success' => true,
-                    'qr' => $response->data['qr'],
-                    'md5' => $response->data['md5'],
-                );
-
-                // Optionally check transaction status if API token is available
-                if ($this->api_token) {
-                    $bakong = new BakongKHQR($this->api_token);
-                    $status_response = $bakong->checkTransactionByMD5($response->data['md5']);
-                    if ($status_response->status['code'] === 0 && isset($status_response->data['transactionStatus'])) {
-                        $result['status'] = $status_response->data['transactionStatus'];
-                    }
-                }
-
-            } catch (Exception $e) {
-                $result = array(
-                    'success' => false,
-                    'message' => $e->getMessage(),
-                );
-            }
-
-            set_transient('bakong_khqr_test_result', $result, 60); // Store result for 60 seconds
-            wp_redirect(admin_url('admin.php?page=wc-settings&tab=checkout&section=bakong_khqr'));
-            exit;
-        }
+    add_filter('woocommerce_payment_gateways', 'add_bakong_khqr_gateway');
+    function add_bakong_khqr_gateway($gateways) {
+        $gateways[] = 'WC_Bakong_KHQR_Gateway';
+        return $gateways;
     }
 }
 
-add_action('admin_enqueue_scripts', 'bakong_khqr_admin_styles');
-function bakong_khqr_admin_styles($hook) {
-    if ($hook !== 'woocommerce_page_wc-settings' || !isset($_GET['section']) || $_GET['section'] !== 'bakong_khqr') {
-        return;
-    }
-
-    wp_enqueue_style('bootstrap', 'https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css');
-    wp_enqueue_style('font-awesome', 'https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css');
-    
-    $custom_css = '
-        .bakong-khqr-settings {
-            max-width: 900px;
-            margin: 20px auto;
-        }
-        .card-header {
-            background: linear-gradient(45deg, #007bff, #00b4ff);
-        }
-        .form-floating textarea {
-            height: 100px;
-        }
-        .form-check-input:checked {
-            background-color: #007bff;
-            border-color: #007bff;
-        }
-        .form-check-input:focus {
-            box-shadow: 0 0 0 0.25rem rgba(0,123,255,.25);
-        }
-        .btn-primary, .btn-success {
-            background: linear-gradient(45deg, #007bff, #00b4ff);
-            border: none;
-            padding: 10px 30px;
-            transition: all 0.3s ease;
-        }
-        .btn-success {
-            background: linear-gradient(45deg, #28a745, #34d058);
-        }
-        .btn-primary:hover, .btn-success:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 4px 15px rgba(0,123,255,0.4);
-        }
-        .btn-success:hover {
-            box-shadow: 0 4px 15px rgba(40,167,69,0.4);
-        }
-        small.text-muted {
-            display: block;
-            margin-top: 5px;
-        }
-    ';
-    wp_add_inline_style('bootstrap', $custom_css);
-}
-
-add_action('wp', 'bakong_khqr_check_transaction_status');
-function bakong_khqr_check_transaction_status() {
-    if (!is_admin() || !wp_doing_cron()) {
-        return;
-    }
-    
-    $args = array(
-        'status' => 'on-hold',
-        'meta_key' => '_bakong_khqr_md5',
-        'limit' => 50,
+add_action('admin_menu', 'bakong_khqr_admin_menu');
+function bakong_khqr_admin_menu() {
+    add_menu_page(
+        'Bakong KHQR Settings',
+        'Bakong KHQR',
+        'manage_options',
+        'bakong-khqr-settings',
+        'bakong_khqr_admin_page',
+        'dashicons-money-alt'
     );
     
-    $orders = wc_get_orders($args);
-    $gateway = WC()->payment_gateways()->payment_gateways()['bakong_khqr'];
+    add_submenu_page(
+        'bakong-khqr-settings',
+        'Bakong KHQR Info',
+        'KHQR Info',
+        'manage_options',
+        'bakong-khqr-info',
+        'bakong_khqr_info_page'
+    );
+}
+
+function bakong_khqr_admin_page() {
+    $settings = get_option('woocommerce_bakong_khqr_settings');
+    ?>
+    <div class="wrap">
+        <h1>Bakong KHQR Settings</h1>
+        <nav class="nav-tab-wrapper mb-3">
+            <a href="<?php echo esc_url(admin_url('admin.php?page=bakong-khqr-settings')); ?>" class="nav-tab nav-tab-active">Test QR</a>
+            <a href="<?php echo esc_url(admin_url('admin.php?page=bakong-khqr-info')); ?>" class="nav-tab">KHQR Info</a>
+        </nav>
+        
+        <div class="card p-3 mb-3">
+            <h3>Test QR Code Generation and Scanning</h3>
+            <form id="testQrForm">
+                <?php wp_nonce_field('khqr_test_settings'); ?>
+                <div class="mb-3">
+                    <label class="form-label">Amount</label>
+                    <input type="number" class="form-control" name="test_amount" value="1000" step="0.01" required>
+                </div>
+                <div class="mb-3">
+                    <label class="form-label">Currency</label>
+                    <select name="test_currency" class="form-control">
+                        <option value="KHR">KHR</option>
+                        <option value="USD">USD</option>
+                    </select>
+                </div>
+                <button type="button" class="btn btn-primary" id="generateTestQr">Generate QR</button>
+                <button type="button" class="btn btn-info" id="scanTestQr">Scan QR</button>
+            </form>
+            <div id="qrGenerationStatus" class="mt-2 text-danger"></div>
+        </div>
+
+        <!-- QR Generation Modal -->
+        <div class="modal fade" id="qrModal" tabindex="-1">
+            <div class="modal-dialog">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title">Generated QR Code</h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                    </div>
+                    <div class="modal-body">
+                        <div id="qrCodeContainer"></div>
+                        <div id="qrError" class="text-danger mt-2"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- QR Scanning Modal -->
+        <div class="modal fade" id="scanModal" tabindex="-1">
+            <div class="modal-dialog modal-lg">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title">Scan QR Code</h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                    </div>
+                    <div class="modal-body">
+                        <div id="qr-reader" style="width: 100%"></div>
+                        <div id="scanResult" class="mt-3"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+    jQuery(document).ready(function($) {
+        // Generate QR Code
+        $('#generateTestQr').click(function() {
+            var amount = $('input[name="test_amount"]').val();
+            var currency = $('select[name="test_currency"]').val();
+            
+            $.ajax({
+                url: ajaxurl,
+                method: 'POST',
+                data: {
+                    action: 'generate_test_qr',
+                    amount: amount,
+                    currency: currency,
+                    nonce: '<?php echo esc_js(wp_create_nonce('generate_test_qr')); ?>'
+                },
+                success: function(response) {
+                    $('#qrGenerationStatus').html('');
+                    if (response.success) {
+                        $('#qrCodeContainer').html('<img src="' + response.data.qr + '" class="img-fluid" alt="QR Code">');
+                        $('#qrError').html('');
+                        $('#qrModal').modal('show');
+                    } else {
+                        $('#qrCodeContainer').html('');
+                        $('#qrError').html('Error: ' + response.data.message);
+                        $('#qrGenerationStatus').html('Error generating QR: ' + response.data.message);
+                    }
+                },
+                error: function(xhr, status, error) {
+                    $('#qrCodeContainer').html('');
+                    var errorMessage = 'AJAX Error: ' . status + ' - ' + error + ' (Response: ' + (xhr.responseText || 'No response') + ')';
+                    $('#qrError').html(errorMessage);
+                    $('#qrGenerationStatus').html(errorMessage);
+                    console.log('AJAX Error Details:', xhr, status, error, xhr.responseText);
+                }
+            });
+        });
+
+        let html5QrcodeScanner;
+        $('#scanTestQr').click(function() {
+            $('#scanModal').modal('show');
+            
+            html5QrcodeScanner = new Html5QrcodeScanner(
+                "qr-reader", 
+                { fps: 10, qrbox: { width: 250, height: 250 } }
+            );
+            
+            html5QrcodeScanner.render(
+                function(decodedText) {
+                    $.ajax({
+                        url: ajaxurl,
+                        method: 'POST',
+                        data: {
+                            action: 'decode_test_qr',
+                            qr_code: decodedText,
+                            nonce: '<?php echo esc_js(wp_create_nonce('decode_test_qr')); ?>'
+                        },
+                        success: function(response) {
+                            if (response.success) {
+                                $('#scanResult').html(
+                                    '<div class="alert alert-success">' +
+                                    '<p>Merchant: ' + response.data.merchantName + '</p>' +
+                                    '<p>Amount: ' + response.data.transactionAmount + ' ' + 
+                                    (response.data.transactionCurrency === '840' ? 'USD' : 'KHR') + '</p>' +
+                                    '<p>City: ' + response.data.merchantCity + '</p>' +
+                                    '</div>'
+                                );
+                            } else {
+                                $('#scanResult').html('<div class="alert alert-danger">Error: ' + response.data.message + '</div>');
+                            }
+                        }
+                    });
+                    html5QrcodeScanner.clear();
+                },
+                function(error) {
+                    console.warn('QR Scan Error:', error);
+                }
+            );
+        });
+
+        $('#scanModal').on('hidden.bs.modal', function() {
+            if (html5QrcodeScanner) {
+                html5QrcodeScanner.clear();
+            }
+        });
+    });
+    </script>
+    <?php
+}
+
+function bakong_khqr_info_page() {
+    $settings = get_option('woocommerce_bakong_khqr_settings');
+    ?>
+    <div class="wrap">
+        <h1>Bakong KHQR Information</h1>
+        <nav class="nav-tab-wrapper mb-3">
+            <a href="<?php echo esc_url(admin_url('admin.php?page=bakong-khqr-settings')); ?>" class="nav-tab">Test QR</a>
+            <a href="<?php echo esc_url(admin_url('admin.php?page=bakong-khqr-info')); ?>" class="nav-tab nav-tab-active">KHQR Info</a>
+        </nav>
+        
+        <div class="card p-3">
+            <h3>Current Configuration</h3>
+            <table class="table">
+                <tr>
+                    <th>Bakong Account ID</th>
+                    <td><?php echo esc_html($settings['bakong_account_id'] ?? 'Not set'); ?></td>
+                </tr>
+                <tr>
+                    <th>Merchant Name</th>
+                    <td><?php echo esc_html($settings['merchant_name'] ?? 'Not set'); ?></td>
+                </tr>
+                <tr>
+                    <th>Merchant City</th>
+                    <td><?php echo esc_html($settings['merchant_city'] ?? 'Not set'); ?></td>
+                </tr>
+                <tr>
+                    <th>API Token</th>
+                    <td><?php echo $settings['api_token'] ? '******** (Set)' : 'Not set'; ?></td>
+                </tr>
+            </table>
+            <p>Configure these settings in <a href="<?php echo esc_url(admin_url('admin.php?page=wc-settings&tab=checkout&section=bakong_khqr')); ?>">WooCommerce Payment Settings</a></p>
+        </div>
+    </div>
+    <?php
+}
+
+add_action('wp_ajax_generate_test_qr', 'generate_test_qr_callback');
+function generate_test_qr_callback() {
+    check_ajax_referer('generate_test_qr', 'nonce');
     
-    if (!$gateway->api_token) {
+    $amount = floatval($_POST['amount']);
+    $currency = sanitize_text_field($_POST['currency']);
+    $settings = get_option('woocommerce_bakong_khqr_settings');
+
+    // Check prerequisites
+    if (empty($settings['api_token'])) {
+        error_log('Generate QR Error: API Token is not configured.');
+        wp_send_json_error(array('message' => 'API Token is not configured. Please set it in WooCommerce settings.'));
         return;
     }
-    
-    $bakong = new BakongKHQR($gateway->api_token);
-    
-    foreach ($orders as $order) {
-        $md5 = $order->get_meta('_bakong_khqr_md5');
-        
-        try {
-            $response = $bakong->checkTransactionByMD5($md5);
-            
-            if ($response->status['code'] === 0 && isset($response->data['transactionStatus']) && $response->data['transactionStatus'] === 'SUCCESS') {
-                $order->payment_complete();
-                $order->add_order_note(__('Payment confirmed via Bakong KHQR', 'woocommerce-bakong-khqr'));
-                $order->save();
+
+    if (empty($settings['bakong_account_id'])) {
+        error_log('Generate QR Error: Bakong Account ID is not configured.');
+        wp_send_json_error(array('message' => 'Bakong Account ID is not configured. Please set it in WooCommerce settings.'));
+        return;
+    }
+
+    if (empty($settings['merchant_name'])) {
+        error_log('Generate QR Error: Merchant Name is not configured.');
+        wp_send_json_error(array('message' => 'Merchant Name is not configured. Please set it in WooCommerce settings.'));
+        return;
+    }
+
+    if (empty($settings['merchant_city'])) {
+        error_log('Generate QR Error: Merchant City is not configured.');
+        wp_send_json_error(array('message' => 'Merchant City is not configured. Please set it in WooCommerce settings.'));
+        return;
+    }
+
+    if (!class_exists('Endroid\QrCode\QrCode')) {
+        error_log('Generate QR Error: Endroid\QrCode\QrCode class not found. Ensure composer require endroid/qrcode was run.');
+        wp_send_json_error(array('message' => 'Endroid\QrCode\QrCode class not found. Run "composer require endroid/qrcode" in the plugin directory.'));
+        return;
+    }
+
+    if (!class_exists('KHQR\BakongKHQR')) {
+        error_log('Generate QR Error: KHQR\BakongKHQR class not found. Ensure composer require fidele007/bakong-khqr-php was run.');
+        wp_send_json_error(array('message' => 'KHQR\BakongKHQR class not found. Run "composer require fidele007/bakong-khqr-php" in the plugin directory.'));
+        return;
+    }
+
+    if (!extension_loaded('gd')) {
+        error_log('Generate QR Error: PHP GD extension is not enabled.');
+        wp_send_json_error(array('message' => 'PHP GD extension is not enabled. Please enable it in php.ini.'));
+        return;
+    }
+
+    if (!extension_loaded('curl')) {
+        error_log('Generate QR Error: PHP cURL extension is not enabled.');
+        wp_send_json_error(array('message' => 'PHP cURL extension is not enabled. Please enable it in php.ini.'));
+        return;
+    }
+
+    // Increase memory limit temporarily
+    ini_set('memory_limit', '256M');
+
+    try {
+        $merchantInfo = new MerchantInfo(
+            bakongAccountID: $settings['bakong_account_id'],
+            merchantName: $settings['merchant_name'],
+            merchantCity: $settings['merchant_city'],
+            merchantID: 'TEST_' . time(),
+            acquiringBank: 'Bakong',
+            mobileNumber: ''
+        );
+
+        $khqr = new BakongKHQR($settings['api_token']);
+        $currency_code = $currency === 'USD' ? KHQRData::CURRENCY_USD : KHQRData::CURRENCY_KHR;
+        $response = BakongKHQR::generateMerchant($merchantInfo, $amount, $currency_code);
+
+        // Log the full response for debugging
+        error_log('Bakong API Response: ' . print_r($response, true));
+
+        if (is_object($response) && property_exists($response, 'status') && $response->status->code === 0) {
+            if (!isset($response->data->qr) || !isset($response->data->md5)) {
+                error_log('Generate QR Error: Invalid response structure from Bakong API. Response: ' . json_encode($response));
+                wp_send_json_error(array('message' => 'Invalid response from Bakong API. Missing qr or md5 data.'));
+                return;
             }
+
+            $qrContent = $response->data->qr;
+            $qrCode = new QrCode($qrContent);
+            $qrCode->setSize(300);
+            $qrImage = 'data:image/png;base64,' . base64_encode($qrCode->writeString());
+
+            wp_send_json_success(array(
+                'qr' => $qrImage,
+                'md5' => $response->data->md5
+            ));
+        } else {
+            $errorMessage = is_object($response) && property_exists($response, 'status') && isset($response->status->message) ? $response->status->message : 'Unknown error from Bakong API';
+            error_log('Generate QR Error: Bakong API error: ' . $errorMessage . ' | Full Response: ' . json_encode($response));
+            wp_send_json_error(array('message' => 'Bakong API error: ' . $errorMessage));
+        }
+    } catch (Exception $e) {
+        $errorMessage = 'Exception: ' . $e->getMessage() . ' (File: ' . $e->getFile() . ', Line: ' . $e->getLine() . ')';
+        error_log('Generate QR Error: ' . $errorMessage);
+        wp_send_json_error(array('message' => 'Exception: ' . $e->getMessage()));
+    }
+    wp_die();
+}
+
+add_action('wp_ajax_decode_test_qr', 'decode_test_qr_callback');
+function decode_test_qr_callback() {
+    check_ajax_referer('decode_test_qr', 'nonce');
+    
+    $qr_code = sanitize_text_field($_POST['qr_code']);
+    $settings = get_option('woocommerce_bakong_khqr_settings');
+
+    if (empty($settings['api_token'])) {
+        error_log('Decode QR Error: API Token is not configured.');
+        wp_send_json_error(array('message' => 'API Token is not configured. Please set it in WooCommerce settings.'));
+        return;
+    }
+
+    try {
+        $khqr = new BakongKHQR($settings['api_token']);
+        $response = BakongKHQR::decode($qr_code);
+
+        // Log the full response for debugging
+        error_log('Bakong API Decode Response: ' . print_r($response, true));
+
+        if (is_object($response) && property_exists($response, 'status') && $response->status->code === 0) {
+            wp_send_json_success($response->data);
+        } else {
+            $errorMessage = is_object($response) && property_exists($response, 'status') && isset($response->status->message) ? $response->status->message : 'Unknown error from Bakong API';
+            error_log('Decode QR Error: ' . $errorMessage);
+            wp_send_json_error(array('message' => 'Decode error: ' . $errorMessage));
+        }
+    } catch (Exception $e) {
+        $errorMessage = 'Exception: ' . $e->getMessage() . ' (File: ' . $e->getFile() . ', Line: ' . $e->getLine() . ')';
+        error_log('Decode QR Error: ' . $errorMessage);
+        wp_send_json_error(array('message' => 'Decode Exception: ' . $e->getMessage()));
+    }
+    wp_die();
+}
+
+add_action('woocommerce_thankyou', 'show_khqr_on_thankyou', 10, 1);
+function show_khqr_on_thankyou($order_id) {
+    if (get_post_meta($order_id, '_payment_method', true) !== 'bakong_khqr') return;
+
+    $qr_code = get_post_meta($order_id, '_khqr_qr', true);
+    $currency = get_post_meta($order_id, '_khqr_currency', true);
+    
+    if ($qr_code) {
+        try {
+            $qrCode = new QrCode($qr_code);
+            $qrCode->setSize(300);
+            $qrImage = 'data:image/png;base64,' . base64_encode($qrCode->writeString());
+
+            echo '<div class="card p-3 mt-3">';
+            echo '<h3>Scan to Pay with Bakong KHQR (' . esc_html($currency) . ')</h3>';
+            echo '<img src="' . esc_attr($qrImage) . '" class="img-fluid" alt="Payment QR Code">';
+            echo '</div>';
         } catch (Exception $e) {
-            $order->add_order_note(__('Transaction check failed: ', 'woocommerce-bakong-khqr') . $e->getMessage());
-            $order->save();
+            error_log('Thank You Page QR Error: ' . $e->getMessage());
+            echo '<div class="card p-3 mt-3 text-danger">';
+            echo '<p>Error generating QR code for payment: ' . esc_html($e->getMessage()) . '</p>';
+            echo '</div>';
         }
     }
 }

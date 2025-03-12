@@ -2,13 +2,25 @@
     "name": "novhun/woocommerce-bakong-khqr",
     "description": "Bakong KHQR Payment Gateway for WooCommerce",
     "type": "wordpress-plugin",
+    "license": "GPL-2.0-or-later",
     "require": {
+        "php": ">=7.4",
         "fidele007/bakong-khqr-php": "^1.0",
-        "php": ">=7.4"
+        "endroid/qrcode": "^5.1"
     },
-    "autoload": {
-        "psr-4": {
-            "BakongKHQR\\": "src/"
+    "scripts": {
+        "post-install-cmd": [
+            "@php -r \"file_put_contents('vendor/.htaccess', 'Deny from all');\""
+        ],
+        "post-update-cmd": [
+            "@php -r \"file_put_contents('vendor/.htaccess', 'Deny from all');\""
+        ]
+    },
+    "extra": {
+        "wordpress-plugin": {
+            "plugin_main_file": "woocommerce-bakong-khqr.php"
         }
-    }
+    },
+    "minimum-stability": "dev",
+    "prefer-stable": true
 }
