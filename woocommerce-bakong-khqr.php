@@ -5,7 +5,7 @@
  * Description: Accept payments via Bakong KHQR in WooCommerce
  * Author: Nov Hun
  * Author URI: https://github.com/novhun/woocommerce-bakong-khqr
- * Version: 1.0.1
+ * Version: 1.1.0
  * Requires at least: 5.0
  * Tested up to: 6.4
  * WC requires at least: 3.0
@@ -69,6 +69,7 @@ function init_bakong_khqr_gateway() {
             
             add_action('woocommerce_update_options_payment_gateways_' . $this->id, array($this, 'process_admin_options'));
             add_action('woocommerce_thankyou_' . $this->id, array($this, 'thankyou_page'));
+            add_action('admin_post_bakong_khqr_test_payment', array($this, 'handle_test_payment'));
         }
 
         public function init_form_fields() {
@@ -125,6 +126,8 @@ function init_bakong_khqr_gateway() {
         }
 
         public function admin_options() {
+            $test_result = get_transient('bakong_khqr_test_result'); // Get test result if available
+            delete_transient('bakong_khqr_test_result'); // Clear after display
             ?>
             <div class="bakong-khqr-settings">
                 <div class="card shadow-sm border-0">
@@ -231,6 +234,54 @@ function init_bakong_khqr_gateway() {
                                 </button>
                             </div>
                         </form>
+
+                        <!-- Test Payment Section -->
+                        <hr class="my-4">
+                        <h4 class="mt-4"><i class="fas fa-flask me-2"></i><?php _e('Test Payment', 'woocommerce-bakong-khqr'); ?></h4>
+                        <form method="post" action="<?php echo admin_url('admin-post.php'); ?>" class="mt-3">
+                            <input type="hidden" name="action" value="bakong_khqr_test_payment">
+                            <?php wp_nonce_field('bakong_khqr_test_payment_nonce', 'test_payment_nonce'); ?>
+                            <div class="row g-3">
+                                <div class="col-md-6">
+                                    <div class="form-floating">
+                                        <input type="number" class="form-control" 
+                                               id="test_amount" 
+                                               name="test_amount" 
+                                               value="1000" 
+                                               min="1" 
+                                               required 
+                                               placeholder="Test Amount">
+                                        <label for="test_amount"><?php _e('Test Amount (KHR)', 'woocommerce-bakong-khqr'); ?></label>
+                                    </div>
+                                </div>
+                                <div class="col-md-6 d-flex align-items-end">
+                                    <button type="submit" class="btn btn-success w-100">
+                                        <i class="fas fa-play me-2"></i><?php _e('Generate Test QR', 'woocommerce-bakong-khqr'); ?>
+                                    </button>
+                                </div>
+                            </div>
+                        </form>
+
+                        <?php if ($test_result): ?>
+                            <div class="mt-4">
+                                <?php if ($test_result['success']): ?>
+                                    <div class="alert alert-success" role="alert">
+                                        <h5><i class="fas fa-check-circle me-2"></i><?php _e('Test Successful', 'woocommerce-bakong-khqr'); ?></h5>
+                                        <p><?php _e('QR Code Generated:', 'woocommerce-bakong-khqr'); ?></p>
+                                        <img src="https://chart.googleapis.com/chart?chs=200x200&cht=qr&chl=<?php echo urlencode($test_result['qr']); ?>" alt="Test QR Code" class="img-fluid mb-3">
+                                        <p><strong>MD5:</strong> <?php echo esc_html($test_result['md5']); ?></p>
+                                        <?php if ($test_result['status']): ?>
+                                            <p><strong>Transaction Status:</strong> <?php echo esc_html($test_result['status']); ?></p>
+                                        <?php endif; ?>
+                                    </div>
+                                <?php else: ?>
+                                    <div class="alert alert-danger" role="alert">
+                                        <h5><i class="fas fa-exclamation-triangle me-2"></i><?php _e('Test Failed', 'woocommerce-bakong-khqr'); ?></h5>
+                                        <p><?php echo esc_html($test_result['message']); ?></p>
+                                    </div>
+                                <?php endif; ?>
+                            </div>
+                        <?php endif; ?>
                     </div>
                 </div>
             </div>
@@ -255,7 +306,7 @@ function init_bakong_khqr_gateway() {
                     $order->update_meta_data('_bakong_khqr_code', $response->data['qr']);
                     $order->update_meta_data('_bakong_khqr_md5', $response->data['md5']);
                     $order->update_status('on-hold', __('Awaiting Bakong KHQR payment', 'woocommerce-bakong-khqr'));
-                    $order->save(); // Ensure changes are saved for HPOS
+                    $order->save();
                     
                     wc_reduce_stock_levels($order_id);
                     WC()->cart->empty_cart();
@@ -287,6 +338,55 @@ function init_bakong_khqr_gateway() {
                 echo '</div>';
             }
         }
+
+        public function handle_test_payment() {
+            if (!current_user_can('manage_options') || !isset($_POST['test_payment_nonce']) || !wp_verify_nonce($_POST['test_payment_nonce'], 'bakong_khqr_test_payment_nonce')) {
+                wp_die(__('Permission denied', 'woocommerce-bakong-khqr'));
+            }
+
+            $test_amount = isset($_POST['test_amount']) ? floatval($_POST['test_amount']) * 100 : 1000; // Default to 10 KHR if not set
+
+            try {
+                $individualInfo = new IndividualInfo(
+                    bakongAccountID: $this->bakong_account_id,
+                    merchantName: $this->merchant_name,
+                    merchantCity: $this->merchant_city,
+                    currency: KHQRData::CURRENCY_KHR,
+                    amount: $test_amount
+                );
+
+                $response = BakongKHQR::generateIndividual($individualInfo);
+
+                if ($response->status['code'] !== 0) {
+                    throw new Exception(__('KHQR generation failed', 'woocommerce-bakong-khqr'));
+                }
+
+                $result = array(
+                    'success' => true,
+                    'qr' => $response->data['qr'],
+                    'md5' => $response->data['md5'],
+                );
+
+                // Optionally check transaction status if API token is available
+                if ($this->api_token) {
+                    $bakong = new BakongKHQR($this->api_token);
+                    $status_response = $bakong->checkTransactionByMD5($response->data['md5']);
+                    if ($status_response->status['code'] === 0 && isset($status_response->data['transactionStatus'])) {
+                        $result['status'] = $status_response->data['transactionStatus'];
+                    }
+                }
+
+            } catch (Exception $e) {
+                $result = array(
+                    'success' => false,
+                    'message' => $e->getMessage(),
+                );
+            }
+
+            set_transient('bakong_khqr_test_result', $result, 60); // Store result for 60 seconds
+            wp_redirect(admin_url('admin.php?page=wc-settings&tab=checkout&section=bakong_khqr'));
+            exit;
+        }
     }
 }
 
@@ -317,15 +417,21 @@ function bakong_khqr_admin_styles($hook) {
         .form-check-input:focus {
             box-shadow: 0 0 0 0.25rem rgba(0,123,255,.25);
         }
-        .btn-primary {
+        .btn-primary, .btn-success {
             background: linear-gradient(45deg, #007bff, #00b4ff);
             border: none;
             padding: 10px 30px;
             transition: all 0.3s ease;
         }
-        .btn-primary:hover {
+        .btn-success {
+            background: linear-gradient(45deg, #28a745, #34d058);
+        }
+        .btn-primary:hover, .btn-success:hover {
             transform: translateY(-2px);
             box-shadow: 0 4px 15px rgba(0,123,255,0.4);
+        }
+        .btn-success:hover {
+            box-shadow: 0 4px 15px rgba(40,167,69,0.4);
         }
         small.text-muted {
             display: block;
@@ -365,11 +471,11 @@ function bakong_khqr_check_transaction_status() {
             if ($response->status['code'] === 0 && isset($response->data['transactionStatus']) && $response->data['transactionStatus'] === 'SUCCESS') {
                 $order->payment_complete();
                 $order->add_order_note(__('Payment confirmed via Bakong KHQR', 'woocommerce-bakong-khqr'));
-                $order->save(); // Ensure changes are saved for HPOS
+                $order->save();
             }
         } catch (Exception $e) {
             $order->add_order_note(__('Transaction check failed: ', 'woocommerce-bakong-khqr') . $e->getMessage());
-            $order->save(); // Ensure changes are saved for HPOS
+            $order->save();
         }
     }
 }
